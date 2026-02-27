@@ -3,23 +3,16 @@ import logging
 import os
 import sqlite3
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -27,12 +20,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 DEFAULT_CARD_NUMBER = os.getenv("DEFAULT_CARD_NUMBER", "2204320929425611")
-
-SPB_TEXT = (
-    "💳 СПБ перевод\n"
-    "Описание:\n"
-    "Перевод на карту Озон Банка:\n\n"
-)
 
 PLAN_90 = "90_days"
 PLAN_YEAR = "year"
@@ -42,14 +29,14 @@ PLANS = {
     PLAN_YEAR: {"title": "1 год", "price": 14999, "days": 365},
 }
 
+SPB_TEXT = (
+    "💳 СПБ перевод\n"
+    "Описание:\n"
+    "Перевод на карту Озон Банка:\n\n"
+)
 
-@dataclass
-class PendingPayment:
-    user_id: int
-    plan: str
-
-
-pending_by_admin_msg: dict[int, PendingPayment] = {}
+waiting_plan: dict[int, str] = {}
+admin_waiting_card: set[int] = set()
 
 
 def utcnow() -> datetime:
@@ -91,10 +78,12 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS payments (
                 id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
                 plan TEXT NOT NULL,
                 status TEXT NOT NULL,
-                proof_file_id TEXT,
-                proof_type TEXT,
+                proof_file_id TEXT NOT NULL,
+                proof_type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 reviewed_at TEXT,
                 admin_id INTEGER
@@ -122,15 +111,24 @@ def set_setting(key: str, value: str) -> None:
         )
 
 
-def save_payment(user_id: int, plan: str, proof_file_id: str, proof_type: str) -> str:
+def save_payment(message: Message, plan: str, proof_file_id: str, proof_type: str) -> str:
     payment_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             """
-            INSERT INTO payments(id, user_id, plan, status, proof_file_id, proof_type, created_at)
-            VALUES(?, ?, ?, 'pending', ?, ?, ?)
+            INSERT INTO payments(id, user_id, username, full_name, plan, status, proof_file_id, proof_type, created_at)
+            VALUES(?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
-            (payment_id, user_id, plan, proof_file_id, proof_type, utcnow().isoformat()),
+            (
+                payment_id,
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.full_name,
+                plan,
+                proof_file_id,
+                proof_type,
+                utcnow().isoformat(),
+            ),
         )
     return payment_id
 
@@ -143,17 +141,17 @@ def get_payment(payment_id: str):
 def set_payment_status(payment_id: str, status: str, admin_id: int) -> None:
     with connect_db() as conn:
         conn.execute(
-            "UPDATE payments SET status=?, reviewed_at=?, admin_id=? WHERE id=?",
+            "UPDATE payments SET status=?, reviewed_at=?, admin_id=? WHERE id=? AND status='pending'",
             (status, utcnow().isoformat(), admin_id, payment_id),
         )
 
 
-def set_subscription(user: Message, plan: str) -> datetime:
+def set_subscription(user_id: int, username: str | None, full_name: str | None, plan: str) -> datetime:
     duration = timedelta(days=PLANS[plan]["days"])
     with connect_db() as conn:
         current = conn.execute(
             "SELECT expires_at FROM subscriptions WHERE user_id=? AND status='active'",
-            (user.from_user.id,),
+            (user_id,),
         ).fetchone()
         base = utcnow()
         if current:
@@ -174,40 +172,26 @@ def set_subscription(user: Message, plan: str) -> datetime:
                 reminded_7=0,
                 reminded_1=0
             """,
-            (
-                user.from_user.id,
-                user.from_user.username,
-                user.from_user.full_name,
-                plan,
-                new_exp.isoformat(),
-            ),
+            (user_id, username, full_name, plan, new_exp.isoformat()),
         )
         return new_exp
 
 
 def subscription_stats() -> tuple[int, int, int]:
     with connect_db() as conn:
-        active = conn.execute(
-            "SELECT COUNT(*) c FROM subscriptions WHERE status='active'"
-        ).fetchone()["c"]
-        pending = conn.execute(
-            "SELECT COUNT(*) c FROM payments WHERE status='pending'"
-        ).fetchone()["c"]
-        expired = conn.execute(
-            "SELECT COUNT(*) c FROM subscriptions WHERE status='expired'"
-        ).fetchone()["c"]
+        active = conn.execute("SELECT COUNT(*) c FROM subscriptions WHERE status='active'").fetchone()["c"]
+        pending = conn.execute("SELECT COUNT(*) c FROM payments WHERE status='pending'").fetchone()["c"]
+        expired = conn.execute("SELECT COUNT(*) c FROM subscriptions WHERE status='expired'").fetchone()["c"]
     return active, pending, expired
 
 
 def mark_expired(user_id: int):
     with connect_db() as conn:
-        conn.execute(
-            "UPDATE subscriptions SET status='expired' WHERE user_id=?", (user_id,)
-        )
+        conn.execute("UPDATE subscriptions SET status='expired' WHERE user_id=?", (user_id,))
 
 
-def reset_reminder(user_id: int, day: int):
-    col = "reminded_7" if day == 7 else "reminded_1"
+def mark_reminder(user_id: int, days: int):
+    col = "reminded_7" if days == 7 else "reminded_1"
     with connect_db() as conn:
         conn.execute(f"UPDATE subscriptions SET {col}=1 WHERE user_id=?", (user_id,))
 
@@ -215,6 +199,11 @@ def reset_reminder(user_id: int, day: int):
 def get_active_subscriptions():
     with connect_db() as conn:
         return conn.execute("SELECT * FROM subscriptions WHERE status='active'").fetchall()
+
+
+def get_user_subscription(user_id: int):
+    with connect_db() as conn:
+        return conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
 
 
 def user_menu() -> InlineKeyboardMarkup:
@@ -236,14 +225,16 @@ def admin_menu() -> InlineKeyboardMarkup:
     )
 
 
-async def send_payment_instructions(msg: Message, plan: str):
+async def send_payment_instructions(message: Message, plan: str):
     card = get_setting("card_number")
-    text = (
-        f"Вы выбрали: <b>{PLANS[plan]['title']}</b> за <b>{PLANS[plan]['price']} ₽</b>.\n\n"
+    waiting_plan[message.from_user.id] = plan
+    await message.answer(
+        f"Вы выбрали тариф: <b>{PLANS[plan]['title']}</b> за <b>{PLANS[plan]['price']} ₽</b>.\n\n"
         f"{SPB_TEXT}<code>{card}</code>\n\n"
-        "После оплаты пришлите в чат скриншот/чек одним сообщением."
+        "После оплаты пришлите скриншот/чек в этот чат."
+        "\nВажно: отправьте одним сообщением (фото или файл).",
+        parse_mode=ParseMode.HTML,
     )
-    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 async def create_single_use_link(bot: Bot) -> str:
@@ -256,7 +247,7 @@ async def create_single_use_link(bot: Bot) -> str:
     return invite.invite_link
 
 
-async def scheduled_jobs(bot: Bot):
+async def process_scheduler(bot: Bot):
     for sub in get_active_subscriptions():
         user_id = sub["user_id"]
         exp = datetime.fromisoformat(sub["expires_at"])
@@ -269,7 +260,7 @@ async def scheduled_jobs(bot: Bot):
                 "⏰ Напоминание: до конца подписки осталось около 7 дней. Продлите заранее.",
                 reply_markup=user_menu(),
             )
-            reset_reminder(user_id, 7)
+            mark_reminder(user_id, 7)
 
         if 0 <= days_left <= 1 and not sub["reminded_1"]:
             await bot.send_message(
@@ -277,18 +268,18 @@ async def scheduled_jobs(bot: Bot):
                 "⚠️ Подписка заканчивается менее чем через сутки. Чтобы не потерять доступ — продлите.",
                 reply_markup=user_menu(),
             )
-            reset_reminder(user_id, 1)
+            mark_reminder(user_id, 1)
 
         if utcnow() >= exp:
             try:
                 await bot.ban_chat_member(PRIVATE_CHANNEL_ID, user_id)
                 await bot.unban_chat_member(PRIVATE_CHANNEL_ID, user_id, only_if_banned=True)
-            except Exception as e:
-                logging.warning("Failed to remove user %s from channel: %s", user_id, e)
+            except Exception as error:  # noqa: BLE001
+                logging.warning("Не удалось удалить пользователя %s из канала: %s", user_id, error)
             mark_expired(user_id)
             await bot.send_message(
                 user_id,
-                "❌ Подписка истекла, доступ к каналу отключен. Оплатите, чтобы получить новую ссылку.",
+                "❌ Подписка истекла. Доступ в канал отключен. Оплатите заново для получения новой ссылки.",
                 reply_markup=user_menu(),
             )
 
@@ -304,7 +295,7 @@ async def main():
     @dp.message(Command("start"))
     async def start(message: Message):
         await message.answer(
-            "Привет! Я бот подписок. Все управление через кнопки ниже.",
+            "Привет! Я бот управления подпиской на приватный канал.",
             reply_markup=user_menu(),
         )
 
@@ -322,74 +313,59 @@ async def main():
 
     @dp.callback_query(F.data == "my_status")
     async def my_status(call: CallbackQuery):
-        with connect_db() as conn:
-            row = conn.execute(
-                "SELECT * FROM subscriptions WHERE user_id=?", (call.from_user.id,)
-            ).fetchone()
+        row = get_user_subscription(call.from_user.id)
         if not row:
-            await call.message.answer("Подписка не найдена.")
+            await call.message.answer("У вас пока нет активной подписки.", reply_markup=user_menu())
         else:
             await call.message.answer(
-                f"Статус: {row['status']}\nДо: {row['expires_at']}\nТариф: {PLANS[row['plan']]['title']}"
+                f"Тариф: {PLANS[row['plan']]['title']}\n"
+                f"Статус: {row['status']}\n"
+                f"Действует до: {row['expires_at']}",
+                reply_markup=user_menu(),
             )
         await call.answer()
 
     @dp.message(F.photo | F.document)
     async def payment_proof(message: Message):
-        caption = message.caption or ""
-        plan = PLAN_90 if "90" in caption else PLAN_YEAR if "год" in caption.lower() else None
-
-        if plan is None:
-            # Берем последний незакрытый платеж, если есть
-            with connect_db() as conn:
-                pending = conn.execute(
-                    "SELECT plan FROM payments WHERE user_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1",
-                    (message.from_user.id,),
-                ).fetchone()
-            plan = pending["plan"] if pending else PLAN_90
+        plan = waiting_plan.get(message.from_user.id)
+        if not plan:
+            return await message.answer(
+                "Сначала выберите тариф кнопками, затем отправьте чек.",
+                reply_markup=user_menu(),
+            )
 
         if message.photo:
-            file_id = message.photo[-1].file_id
+            proof_file_id = message.photo[-1].file_id
             proof_type = "photo"
         else:
-            file_id = message.document.file_id
+            proof_file_id = message.document.file_id
             proof_type = "document"
 
-        payment_id = save_payment(message.from_user.id, plan, file_id, proof_type)
+        payment_id = save_payment(message, plan, proof_file_id, proof_type)
+        waiting_plan.pop(message.from_user.id, None)
 
-        buttons = InlineKeyboardMarkup(
+        review_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(
-                        text="✅ Подтвердить",
-                        callback_data=f"approve:{payment_id}",
-                    ),
-                    InlineKeyboardButton(
-                        text="❌ Отклонить",
-                        callback_data=f"reject:{payment_id}",
-                    ),
+                    InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve:{payment_id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{payment_id}"),
                 ]
             ]
         )
-
         admin_text = (
-            f"Новая оплата #{payment_id}\n"
+            f"Новый платеж #{payment_id}\n"
             f"Пользователь: {message.from_user.full_name} (@{message.from_user.username})\n"
-            f"user_id: {message.from_user.id}\n"
+            f"ID: {message.from_user.id}\n"
             f"Тариф: {PLANS[plan]['title']} ({PLANS[plan]['price']} ₽)"
         )
 
         for admin_id in ADMIN_IDS:
             if proof_type == "photo":
-                sent = await message.bot.send_photo(admin_id, file_id, caption=admin_text, reply_markup=buttons)
+                await bot.send_photo(admin_id, proof_file_id, caption=admin_text, reply_markup=review_kb)
             else:
-                sent = await message.bot.send_document(admin_id, file_id, caption=admin_text, reply_markup=buttons)
-            pending_by_admin_msg[sent.message_id] = PendingPayment(
-                user_id=message.from_user.id,
-                plan=plan,
-            )
+                await bot.send_document(admin_id, proof_file_id, caption=admin_text, reply_markup=review_kb)
 
-        await message.answer("Чек отправлен администратору на проверку. Ожидайте подтверждения.")
+        await message.answer("Чек отправлен администратору. Ожидайте решения ✅")
 
     @dp.callback_query(F.data.startswith("approve:"))
     async def approve(call: CallbackQuery):
@@ -402,30 +378,23 @@ async def main():
             return await call.answer("Уже обработано")
 
         set_payment_status(payment_id, "approved", call.from_user.id)
-
-        user_chat = await bot.get_chat(payment["user_id"])
-        fake_msg = Message.model_validate(
-            {
-                "message_id": 0,
-                "date": int(datetime.now().timestamp()),
-                "chat": {"id": payment["user_id"], "type": "private"},
-                "from": {
-                    "id": payment["user_id"],
-                    "is_bot": False,
-                    "first_name": user_chat.first_name or "User",
-                },
-            }
+        exp = set_subscription(
+            payment["user_id"],
+            payment["username"],
+            payment["full_name"],
+            payment["plan"],
         )
-        exp = set_subscription(fake_msg, payment["plan"])
-        link = await create_single_use_link(bot)
+        invite_link = await create_single_use_link(bot)
 
         await bot.send_message(
             payment["user_id"],
-            f"✅ Оплата подтверждена!\nВаша подписка активна до: {exp.isoformat()}\n"
-            f"Одноразовая ссылка в канал:\n{link}",
+            f"✅ Оплата подтверждена!\n"
+            f"Подписка активна до: {exp.isoformat()}\n"
+            f"Ваша одноразовая ссылка:\n{invite_link}",
+            reply_markup=user_menu(),
         )
         await call.message.edit_reply_markup(reply_markup=None)
-        await call.answer("Подтверждено")
+        await call.answer("Оплата подтверждена")
 
     @dp.callback_query(F.data.startswith("reject:"))
     async def reject(call: CallbackQuery):
@@ -444,7 +413,7 @@ async def main():
             reply_markup=user_menu(),
         )
         await call.message.edit_reply_markup(reply_markup=None)
-        await call.answer("Отклонено")
+        await call.answer("Платеж отклонен")
 
     @dp.callback_query(F.data == "admin_stats")
     async def admin_stats(call: CallbackQuery):
@@ -452,7 +421,9 @@ async def main():
             return await call.answer("Нет доступа", show_alert=True)
         active, pending, expired = subscription_stats()
         await call.message.answer(
-            f"📊 Статистика:\nАктивных: {active}\nОжидают проверки: {pending}\nИстекших: {expired}"
+            f"📊 Статистика\nАктивные подписки: {active}\n"
+            f"Ожидают проверки: {pending}\nИстекшие: {expired}",
+            reply_markup=admin_menu(),
         )
         await call.answer()
 
@@ -460,23 +431,24 @@ async def main():
     async def admin_change_card(call: CallbackQuery):
         if call.from_user.id not in ADMIN_IDS:
             return await call.answer("Нет доступа", show_alert=True)
-        await call.message.answer(
-            "Отправьте новый номер карты сообщением в формате:\n/card 0000000000000000"
-        )
+        admin_waiting_card.add(call.from_user.id)
+        await call.message.answer("Введите новый номер карты одним сообщением.")
         await call.answer()
 
-    @dp.message(Command("card"))
-    async def update_card(message: Message):
-        if message.from_user.id not in ADMIN_IDS:
-            return await message.answer("Нет доступа")
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            return await message.answer("Использование: /card 0000000000000000")
-        set_setting("card_number", parts[1].strip())
-        await message.answer("Номер карты обновлен ✅")
+    @dp.message(F.text)
+    async def handle_text(message: Message):
+        if message.from_user.id in admin_waiting_card and message.from_user.id in ADMIN_IDS:
+            card_number = message.text.strip().replace(" ", "")
+            if not card_number.isdigit() or len(card_number) < 16:
+                return await message.answer("Неверный формат. Введите только цифры номера карты.")
+            set_setting("card_number", card_number)
+            admin_waiting_card.discard(message.from_user.id)
+            return await message.answer("Номер карты обновлен ✅", reply_markup=admin_menu())
+
+        await message.answer("Используйте кнопки ниже.", reply_markup=user_menu())
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(scheduled_jobs, "interval", minutes=30, args=[bot])
+    scheduler.add_job(process_scheduler, "interval", minutes=30, args=[bot])
     scheduler.start()
 
     await dp.start_polling(bot)
