@@ -4,10 +4,13 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -20,6 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 DEFAULT_CARD_NUMBER = os.getenv("DEFAULT_CARD_NUMBER", "2204320929425611")
+USER_TIMEZONE = os.getenv("USER_TIMEZONE", "Europe/Moscow")
 
 PLAN_90 = "90_days"
 PLAN_YEAR = "year"
@@ -35,12 +39,34 @@ SPB_TEXT = (
     "Перевод на карту Озон Банка:\n\n"
 )
 
-waiting_plan: dict[int, str] = {}
-admin_waiting_card: set[int] = set()
+
+class UserFlow(StatesGroup):
+    waiting_payment_proof = State()
+
+
+class AdminFlow(StatesGroup):
+    waiting_new_card = State()
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def user_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(USER_TIMEZONE)
+    except Exception:  # noqa: BLE001
+        return ZoneInfo("UTC")
+
+
+def format_date_for_user(dt_or_iso: datetime | str) -> str:
+    try:
+        value = dt_or_iso if isinstance(dt_or_iso, datetime) else datetime.fromisoformat(dt_or_iso)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(user_tz()).date().isoformat()
+    except Exception:  # noqa: BLE001
+        return str(dt_or_iso)[:10]
 
 
 def connect_db() -> sqlite3.Connection:
@@ -106,7 +132,6 @@ def init_db() -> None:
         )
 
 
-
 def register_user_if_new(user_id: int, username: str | None, full_name: str | None) -> bool:
     with connect_db() as conn:
         cur = conn.execute(
@@ -120,6 +145,7 @@ def register_user_if_new(user_id: int, username: str | None, full_name: str | No
             (username, full_name, user_id),
         )
         return False
+
 
 def get_setting(key: str) -> str:
     with connect_db() as conn:
@@ -161,6 +187,14 @@ def save_payment(message: Message, plan: str, proof_file_id: str, proof_type: st
 def get_payment(payment_id: str):
     with connect_db() as conn:
         return conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+
+
+def get_pending_payments(limit: int = 20):
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT * FROM payments WHERE status='pending' ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
 
 
 def set_payment_status(payment_id: str, status: str, admin_id: int) -> None:
@@ -246,14 +280,25 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📥 Ожидающие оплаты", callback_data="admin_pending")],
             [InlineKeyboardButton(text="💳 Сменить номер карты", callback_data="admin_change_card")],
         ]
     )
 
 
-async def send_payment_instructions(message: Message, user_id: int, plan: str):
+def payment_review_kb(payment_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve:{payment_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{payment_id}"),
+            ]
+        ]
+    )
+
+
+async def send_payment_instructions(message: Message, plan: str):
     card = get_setting("card_number")
-    waiting_plan[user_id] = plan
     await message.answer(
         f"Вы выбрали тариф: <b>{PLANS[plan]['title']}</b> за <b>{PLANS[plan]['price']} ₽</b>.\n\n"
         f"{SPB_TEXT}<code>{card}</code>\n\n"
@@ -356,9 +401,11 @@ async def main():
         await call.answer()
 
     @dp.callback_query(F.data.startswith("buy:"))
-    async def buy(call: CallbackQuery):
+    async def buy(call: CallbackQuery, state: FSMContext):
         plan = call.data.split(":", 1)[1]
-        await send_payment_instructions(call.message, call.from_user.id, plan)
+        await state.set_state(UserFlow.waiting_payment_proof)
+        await state.update_data(plan=plan)
+        await send_payment_instructions(call.message, plan)
         await call.answer()
 
     @dp.callback_query(F.data == "my_status")
@@ -370,19 +417,18 @@ async def main():
             await call.message.answer(
                 f"Тариф: {PLANS[row['plan']]['title']}\n"
                 f"Статус: {row['status']}\n"
-                f"Действует до: {row['expires_at']}",
-                reply_markup=user_menu(),
+                f"Действует до: {format_date_for_user(row['expires_at'])}",
+                reply_markup=user_menu(is_admin=call.from_user.id in ADMIN_IDS),
             )
         await call.answer()
 
-    @dp.message(F.photo | F.document)
-    async def payment_proof(message: Message):
-        plan = waiting_plan.get(message.from_user.id)
+    @dp.message(UserFlow.waiting_payment_proof, F.photo | F.document)
+    async def payment_proof(message: Message, state: FSMContext):
+        data = await state.get_data()
+        plan = data.get("plan")
         if not plan:
-            return await message.answer(
-                "Сначала выберите тариф кнопками, затем отправьте чек.",
-                reply_markup=user_menu(),
-            )
+            await state.clear()
+            return await message.answer("Сначала выберите тариф кнопками.", reply_markup=user_menu())
 
         if message.photo:
             proof_file_id = message.photo[-1].file_id
@@ -392,16 +438,8 @@ async def main():
             proof_type = "document"
 
         payment_id = save_payment(message, plan, proof_file_id, proof_type)
-        waiting_plan.pop(message.from_user.id, None)
+        await state.clear()
 
-        review_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve:{payment_id}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{payment_id}"),
-                ]
-            ]
-        )
         admin_text = (
             f"Новый платеж #{payment_id}\n"
             f"Пользователь: {message.from_user.full_name} (@{message.from_user.username})\n"
@@ -411,11 +449,18 @@ async def main():
 
         for admin_id in ADMIN_IDS:
             if proof_type == "photo":
-                await bot.send_photo(admin_id, proof_file_id, caption=admin_text, reply_markup=review_kb)
+                await bot.send_photo(admin_id, proof_file_id, caption=admin_text, reply_markup=payment_review_kb(payment_id))
             else:
-                await bot.send_document(admin_id, proof_file_id, caption=admin_text, reply_markup=review_kb)
+                await bot.send_document(admin_id, proof_file_id, caption=admin_text, reply_markup=payment_review_kb(payment_id))
 
         await message.answer("Чек отправлен администратору. Ожидайте решения ✅")
+
+    @dp.message(F.photo | F.document)
+    async def payment_proof_no_state(message: Message):
+        await message.answer(
+            "Сначала выберите тариф кнопками, затем отправьте чек.",
+            reply_markup=user_menu(is_admin=message.from_user.id in ADMIN_IDS),
+        )
 
     @dp.callback_query(F.data.startswith("approve:"))
     async def approve(call: CallbackQuery):
@@ -439,7 +484,7 @@ async def main():
         await bot.send_message(
             payment["user_id"],
             f"✅ Оплата подтверждена!\n"
-            f"Подписка активна до: {exp.date().isoformat()}\n"
+            f"Подписка активна до: {format_date_for_user(exp)}\n"
             f"Ваша одноразовая ссылка:\n{invite_link}",
             reply_markup=user_menu(),
         )
@@ -477,25 +522,86 @@ async def main():
         )
         await call.answer()
 
-    @dp.callback_query(F.data == "admin_change_card")
-    async def admin_change_card(call: CallbackQuery):
+    @dp.callback_query(F.data == "admin_pending")
+    async def admin_pending(call: CallbackQuery):
         if call.from_user.id not in ADMIN_IDS:
             return await call.answer("Нет доступа", show_alert=True)
-        admin_waiting_card.add(call.from_user.id)
+
+        pending = get_pending_payments(limit=20)
+        if not pending:
+            await call.message.answer("Сейчас нет ожидающих оплат.", reply_markup=admin_menu())
+            return await call.answer()
+
+        lines = ["📥 Ожидающие оплаты (последние 20):"]
+        keyboard_rows = []
+        for row in pending:
+            lines.append(
+                f"• {row['id'][:8]} | ID:{row['user_id']} | {PLANS[row['plan']]['title']} | {format_date_for_user(row['created_at'])}"
+            )
+            keyboard_rows.append(
+                [InlineKeyboardButton(text=f"Открыть {row['id'][:8]}", callback_data=f"pending_open:{row['id']}")]
+            )
+
+        await call.message.answer(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
+        await call.answer()
+
+    @dp.callback_query(F.data.startswith("pending_open:"))
+    async def pending_open(call: CallbackQuery):
+        if call.from_user.id not in ADMIN_IDS:
+            return await call.answer("Нет доступа", show_alert=True)
+
+        payment_id = call.data.split(":", 1)[1]
+        payment = get_payment(payment_id)
+        if not payment:
+            return await call.answer("Платеж не найден", show_alert=True)
+
+        caption = (
+            f"Платеж #{payment['id']}\n"
+            f"Статус: {payment['status']}\n"
+            f"Пользователь: {payment['full_name']} (@{payment['username']})\n"
+            f"ID: {payment['user_id']}\n"
+            f"Тариф: {PLANS[payment['plan']]['title']} ({PLANS[payment['plan']]['price']} ₽)\n"
+            f"Создан: {format_date_for_user(payment['created_at'])}"
+        )
+        kb = payment_review_kb(payment_id) if payment["status"] == "pending" else None
+
+        if payment["proof_type"] == "photo":
+            await bot.send_photo(call.from_user.id, payment["proof_file_id"], caption=caption, reply_markup=kb)
+        else:
+            await bot.send_document(call.from_user.id, payment["proof_file_id"], caption=caption, reply_markup=kb)
+        await call.answer()
+
+    @dp.callback_query(F.data == "admin_change_card")
+    async def admin_change_card(call: CallbackQuery, state: FSMContext):
+        if call.from_user.id not in ADMIN_IDS:
+            return await call.answer("Нет доступа", show_alert=True)
+        await state.set_state(AdminFlow.waiting_new_card)
         await call.message.answer("Введите новый номер карты одним сообщением.")
         await call.answer()
 
+    @dp.message(AdminFlow.waiting_new_card, F.text)
+    async def handle_admin_card_text(message: Message, state: FSMContext):
+        if message.from_user.id not in ADMIN_IDS:
+            await state.clear()
+            return await message.answer("Нет доступа")
+
+        card_number = message.text.strip().replace(" ", "")
+        if not card_number.isdigit() or len(card_number) < 16:
+            return await message.answer("Неверный формат. Введите только цифры номера карты.")
+
+        set_setting("card_number", card_number)
+        await state.clear()
+        await message.answer("Номер карты обновлен ✅", reply_markup=admin_menu())
+
     @dp.message(F.text)
     async def handle_text(message: Message):
-        if message.from_user.id in admin_waiting_card and message.from_user.id in ADMIN_IDS:
-            card_number = message.text.strip().replace(" ", "")
-            if not card_number.isdigit() or len(card_number) < 16:
-                return await message.answer("Неверный формат. Введите только цифры номера карты.")
-            set_setting("card_number", card_number)
-            admin_waiting_card.discard(message.from_user.id)
-            return await message.answer("Номер карты обновлен ✅", reply_markup=admin_menu())
-
-        await message.answer("Используйте кнопки ниже.", reply_markup=user_menu())
+        await message.answer(
+            "Используйте кнопки ниже.",
+            reply_markup=user_menu(is_admin=message.from_user.id in ADMIN_IDS),
+        )
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(process_scheduler, "interval", minutes=30, args=[bot])
