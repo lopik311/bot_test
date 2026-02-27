@@ -231,14 +231,15 @@ def get_user_subscription(user_id: int):
         return conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
 
 
-def user_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Купить 90 дней — 5999 ₽", callback_data=f"buy:{PLAN_90}")],
-            [InlineKeyboardButton(text="Купить 1 год — 14999 ₽", callback_data=f"buy:{PLAN_YEAR}")],
-            [InlineKeyboardButton(text="Мой статус", callback_data="my_status")],
-        ]
-    )
+def user_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Купить 90 дней — 5999 ₽", callback_data=f"buy:{PLAN_90}")],
+        [InlineKeyboardButton(text="Купить 1 год — 14999 ₽", callback_data=f"buy:{PLAN_YEAR}")],
+        [InlineKeyboardButton(text="Мой статус", callback_data="my_status")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="⚙️ Админ. меню", callback_data="open_admin_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_menu() -> InlineKeyboardMarkup:
@@ -321,7 +322,7 @@ async def main():
     async def start(message: Message):
         await message.answer(
             "Тут собран весь мой эксклюзивный секретный контент за все время моей работы ❤️",
-            reply_markup=user_menu(),
+            reply_markup=user_menu(is_admin=message.from_user.id in ADMIN_IDS),
         )
         is_new_user = register_user_if_new(
             user_id=message.from_user.id,
@@ -346,6 +347,13 @@ async def main():
         if message.from_user.id not in ADMIN_IDS:
             return await message.answer("Нет доступа")
         await message.answer("Админ-меню", reply_markup=admin_menu())
+
+    @dp.callback_query(F.data == "open_admin_menu")
+    async def open_admin_menu(call: CallbackQuery):
+        if call.from_user.id not in ADMIN_IDS:
+            return await call.answer("Нет доступа", show_alert=True)
+        await call.message.answer("Админ-меню", reply_markup=admin_menu())
+        await call.answer()
 
     @dp.callback_query(F.data.startswith("buy:"))
     async def buy(call: CallbackQuery):
