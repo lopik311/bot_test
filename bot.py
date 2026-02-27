@@ -298,6 +298,17 @@ async def main():
             "Привет! Я бот управления подпиской на приватный канал.",
             reply_markup=user_menu(),
         )
+        username = f"@{message.from_user.username}" if message.from_user.username else "(без username)"
+        admin_text = (
+            "🆕 Новый пользователь зарегистрировался!\n\n"
+            f"👤 Пользователь: {username}\n"
+            f"🆔 ID: {message.from_user.id}"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, admin_text)
+            except Exception as error:  # noqa: BLE001
+                logging.warning("Не удалось отправить уведомление админу %s: %s", admin_id, error)
 
     @dp.message(Command("admin"))
     async def admin(message: Message):
