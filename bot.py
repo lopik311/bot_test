@@ -225,9 +225,9 @@ def admin_menu() -> InlineKeyboardMarkup:
     )
 
 
-async def send_payment_instructions(message: Message, plan: str):
+async def send_payment_instructions(message: Message, user_id: int, plan: str):
     card = get_setting("card_number")
-    waiting_plan[message.from_user.id] = plan
+    waiting_plan[user_id] = plan
     await message.answer(
         f"Вы выбрали тариф: <b>{PLANS[plan]['title']}</b> за <b>{PLANS[plan]['price']} ₽</b>.\n\n"
         f"{SPB_TEXT}<code>{card}</code>\n\n"
@@ -308,7 +308,7 @@ async def main():
     @dp.callback_query(F.data.startswith("buy:"))
     async def buy(call: CallbackQuery):
         plan = call.data.split(":", 1)[1]
-        await send_payment_instructions(call.message, plan)
+        await send_payment_instructions(call.message, call.from_user.id, plan)
         await call.answer()
 
     @dp.callback_query(F.data == "my_status")
