@@ -234,7 +234,7 @@ def get_user_subscription(user_id: int):
 def user_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Купить 90 дней — 9999 ₽", callback_data=f"buy:{PLAN_90}")],
+            [InlineKeyboardButton(text="Купить 90 дней — 5999 ₽", callback_data=f"buy:{PLAN_90}")],
             [InlineKeyboardButton(text="Купить 1 год — 14999 ₽", callback_data=f"buy:{PLAN_YEAR}")],
             [InlineKeyboardButton(text="Мой статус", callback_data="my_status")],
         ]
@@ -320,7 +320,7 @@ async def main():
     @dp.message(Command("start"))
     async def start(message: Message):
         await message.answer(
-            "Привет! Я бот управления подпиской на приватный канал.",
+            "Тут собран весь мой эксклюзивный секретный контент за все время моей работы ❤️",
             reply_markup=user_menu(),
         )
         is_new_user = register_user_if_new(
