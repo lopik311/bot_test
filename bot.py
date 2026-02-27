@@ -25,7 +25,7 @@ PLAN_90 = "90_days"
 PLAN_YEAR = "year"
 
 PLANS = {
-    PLAN_90: {"title": "90 дней", "price": 9999, "days": 90},
+    PLAN_90: {"title": "90 дней", "price": 5999, "days": 90},
     PLAN_YEAR: {"title": "1 год", "price": 14999, "days": 365},
 }
 
@@ -91,10 +91,35 @@ def init_db() -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                first_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('card_number', ?)",
             (DEFAULT_CARD_NUMBER,),
         )
 
+
+
+def register_user_if_new(user_id: int, username: str | None, full_name: str | None) -> bool:
+    with connect_db() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO users(user_id, username, full_name, first_seen_at) VALUES(?, ?, ?, ?)",
+            (user_id, username, full_name, utcnow().isoformat()),
+        )
+        if cur.rowcount == 1:
+            return True
+        conn.execute(
+            "UPDATE users SET username=?, full_name=? WHERE user_id=?",
+            (username, full_name, user_id),
+        )
+        return False
 
 def get_setting(key: str) -> str:
     with connect_db() as conn:
@@ -298,17 +323,23 @@ async def main():
             "Привет! Я бот управления подпиской на приватный канал.",
             reply_markup=user_menu(),
         )
-        username = f"@{message.from_user.username}" if message.from_user.username else "(без username)"
-        admin_text = (
-            "🆕 Новый пользователь зарегистрировался!\n\n"
-            f"👤 Пользователь: {username}\n"
-            f"🆔 ID: {message.from_user.id}"
+        is_new_user = register_user_if_new(
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
         )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, admin_text)
-            except Exception as error:  # noqa: BLE001
-                logging.warning("Не удалось отправить уведомление админу %s: %s", admin_id, error)
+        if is_new_user:
+            username = f"@{message.from_user.username}" if message.from_user.username else "(без username)"
+            admin_text = (
+                "🆕 Новый пользователь зарегистрировался!\n\n"
+                f"👤 Пользователь: {username}\n"
+                f"🆔 ID: {message.from_user.id}"
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_text)
+                except Exception as error:  # noqa: BLE001
+                    logging.warning("Не удалось отправить уведомление админу %s: %s", admin_id, error)
 
     @dp.message(Command("admin"))
     async def admin(message: Message):
@@ -400,7 +431,7 @@ async def main():
         await bot.send_message(
             payment["user_id"],
             f"✅ Оплата подтверждена!\n"
-            f"Подписка активна до: {exp.isoformat()}\n"
+            f"Подписка активна до: {exp.date().isoformat()}\n"
             f"Ваша одноразовая ссылка:\n{invite_link}",
             reply_markup=user_menu(),
         )
