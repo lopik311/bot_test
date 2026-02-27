@@ -22,12 +22,19 @@
 ## Запуск
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 # Заполните BOT_TOKEN, ADMIN_IDS, PRIVATE_CHANNEL_ID
 python bot.py
 ```
+
+## Важно про Python
+- Рекомендуемая версия: **Python 3.11 или 3.12**.
+- Если на Windows при старых пакетах возникает зависание/ошибка на `from aiogram import ...`:
+  1. Удалите старые зависимости: `pip uninstall -y aiogram pydantic pydantic-core aiohttp`
+  2. Поставьте версии из `requirements.txt`: `pip install -r requirements.txt`
 
 ## Переменные окружения
 Смотрите `.env.example`:
