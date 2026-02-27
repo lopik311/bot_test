@@ -11,6 +11,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -24,6 +26,9 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PRIVATE_CHANNEL_ID = int(os.getenv("PRIVATE_CHANNEL_ID", "0"))
 DEFAULT_CARD_NUMBER = os.getenv("DEFAULT_CARD_NUMBER", "2204320929425611")
 USER_TIMEZONE = os.getenv("USER_TIMEZONE", "Europe/Moscow")
+FSM_STORAGE = os.getenv("FSM_STORAGE", "redis").lower()
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+PAYMENT_DUPLICATE_WINDOW_MIN = int(os.getenv("PAYMENT_DUPLICATE_WINDOW_MIN", "15"))
 
 PLAN_90 = "90_days"
 PLAN_YEAR = "year"
@@ -67,6 +72,20 @@ def format_date_for_user(dt_or_iso: datetime | str) -> str:
         return value.astimezone(user_tz()).date().isoformat()
     except Exception:  # noqa: BLE001
         return str(dt_or_iso)[:10]
+
+
+def build_fsm_storage():
+    if FSM_STORAGE == "memory":
+        logging.info("FSM storage: memory")
+        return MemoryStorage()
+
+    try:
+        storage = RedisStorage.from_url(REDIS_URL)
+        logging.info("FSM storage: redis (%s)", REDIS_URL)
+        return storage
+    except Exception as error:  # noqa: BLE001
+        logging.warning("Не удалось подключить Redis storage (%s). Используется MemoryStorage.", error)
+        return MemoryStorage()
 
 
 def connect_db() -> sqlite3.Connection:
@@ -129,6 +148,9 @@ def init_db() -> None:
         conn.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('card_number', ?)",
             (DEFAULT_CARD_NUMBER,),
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_payments_dedup ON payments(user_id, proof_file_id, status, created_at)"
         )
 
 
@@ -195,6 +217,21 @@ def get_pending_payments(limit: int = 20):
             "SELECT * FROM payments WHERE status='pending' ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
+
+
+def find_recent_duplicate_payment(user_id: int, proof_file_id: str, window_min: int = PAYMENT_DUPLICATE_WINDOW_MIN):
+    cutoff = (utcnow() - timedelta(minutes=window_min)).isoformat()
+    with connect_db() as conn:
+        return conn.execute(
+            """
+            SELECT id, created_at
+            FROM payments
+            WHERE user_id=? AND proof_file_id=? AND status='pending' AND created_at>=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user_id, proof_file_id, cutoff),
+        ).fetchone()
 
 
 def set_payment_status(payment_id: str, status: str, admin_id: int) -> None:
@@ -361,7 +398,7 @@ async def main():
 
     init_db()
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=build_fsm_storage())
 
     @dp.message(Command("start"))
     async def start(message: Message):
@@ -436,6 +473,17 @@ async def main():
         else:
             proof_file_id = message.document.file_id
             proof_type = "document"
+
+        duplicate = find_recent_duplicate_payment(
+            user_id=message.from_user.id,
+            proof_file_id=proof_file_id,
+        )
+        if duplicate:
+            await state.clear()
+            return await message.answer(
+                "Этот чек уже отправлен на проверку. Пожалуйста, дождитесь решения администратора.",
+                reply_markup=user_menu(is_admin=message.from_user.id in ADMIN_IDS),
+            )
 
         payment_id = save_payment(message, plan, proof_file_id, proof_type)
         await state.clear()
